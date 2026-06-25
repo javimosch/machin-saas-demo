@@ -1,3 +1,7 @@
 machnotes
 app.mfl
+client.mfl
+server.mfl
+app.wasm
+src/host_gen.src
 *.o

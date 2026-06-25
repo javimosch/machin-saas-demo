@@ -1,0 +1,72 @@
+// client.src — the reactive view (WebAssembly). It holds the note list and renders
+// it; the host fetches /api/notes and hands the JSON here via load(). Adds/deletes go
+// host → API → reload, and the keyed list patches only the rows that changed.
+// Composed with reactive.src; built to wasm (machin build --target wasm).
+
+var ver = 0
+var ids = []int{}
+var bodies = []string{}
+var n = 0
+
+func at_id(id) (k) {
+    k = 0 - 1
+    i := 0
+    while i < n { if ids[i] == id { k = i }  i = i + 1 }
+}
+func body_of(id) (s) { s = ""  k := at_id(id)  if k >= 0 { s = bodies[k] } }
+
+// json_get returns raw JSON tokens — strings keep their quotes; strip them.
+func unq(s) (r) {
+    r = s
+    if len(s) >= 2 {
+        if substr(s, 0, 1) == "\"" { r = substr(s, 1, len(s) - 1) }
+    }
+}
+func esc(s) (r) {
+    r = replace(s, "&", "&amp;")
+    r = replace(r, "<", "&lt;")
+    r = replace(r, ">", "&gt;")
+}
+
+// load_buf returns a buffer for the host to write the notes JSON into.
+export func load_buf(nbytes) (p) { p = alloc(nbytes + 1) }
+
+// load parses the notes JSON (the host wrote it at p) into parallel arrays and
+// triggers a re-render. json_get returns an error past the end → the loop stops.
+export func load(p) {
+    blob := ptr_str(p)
+    free(p)
+    ids = []int{}  bodies = []string{}  n = 0
+    more := 1
+    i := 0
+    while more == 1 {
+        idv, e := json_get(blob, "[" + str(i) + "].id")
+        if e != "" {
+            more = 0
+        } else {
+            bd, _ := json_get(blob, "[" + str(i) + "].body")
+            ids = append(ids, parse_int(idv))
+            bodies = append(bodies, unq(bd))
+            n = n + 1
+            i = i + 1
+        }
+    }
+    set(ver, get(ver) + 1)
+}
+
+// keys are the note ids; a note's body never changes, so add inserts one row and
+// delete removes one — no re-render of kept rows.
+func keys_csv() (s) { get(ver)  s = csv(ids) }
+
+func row_html(id) (h) {
+    h = "<span class=bd>" + esc(body_of(id)) + "</span>" +
+        "<button class=del data-act=del data-id=\"" + str(id) + "\">&times;</button>"
+}
+
+export func start() {
+    ver = signal(0)
+    mount("app",
+        "<div class=add><input id=note_input placeholder=\"a new note…\" autofocus><button id=note_add>Add</button></div>" +
+        list("notes", func() { return keys_csv() }, func(id) { return row_html(id) }) +
+        "<p class=foot><b>" + slot("count", func() { get(ver)  return str(n) }) + "</b> notes</p>")
+}

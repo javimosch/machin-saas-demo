@@ -11,11 +11,13 @@
 type Note struct { id int  body string }
 
 var g_secret = "change-me-in-prod"
+var g_app_port = 48190
+var g_idp_port = 48191
 
-// ---- config ----
+// ---- config (ports are overridable via PORT / IDP_PORT env) ----
 
-func app_origin() (u) { u = "http://localhost:48190" }
-func idp_origin() (u) { u = "http://localhost:48191" }
+func app_origin() (u) { u = "http://localhost:" + str(g_app_port) }
+func idp_origin() (u) { u = "http://localhost:" + str(g_idp_port) }
 
 func provider() (p) {
     p = OAuthProvider{
@@ -111,6 +113,20 @@ func add_note(email, body) {
     pg_release(c)
 }
 
+func del_note(email, id) {
+    if id == "" { return }
+    c := pg_acquire()
+    d := pgx(c, "DELETE FROM notes WHERE id = $1 AND email = $2", []string{id, email})
+    pg_release(c)
+}
+
+// notes_json returns this user's notes as the JSON-array string the wasm client parses.
+func notes_json(email) (j) {
+    c := pg_acquire()
+    j = pgx(c, "SELECT id, body FROM notes WHERE email = $1 ORDER BY id DESC", []string{email})
+    pg_release(c)
+}
+
 // ---- pages ----
 
 func landing_page() (h) {
@@ -120,19 +136,28 @@ func landing_page() (h) {
         "<p><a class=btn href=\"/login\">Log in with SSO</a></p>"
 }
 
-func dashboard_page(email, notes) (h) {
-    items := ""
-    i := 0
-    while i < len(notes) {
-        items = items + "<li>" + html_escape(notes[i].body) + "</li>"
-        i = i + 1
-    }
-    if len(notes) == 0 { items = "<li><em>No notes yet — add one below.</em></li>" }
-    h = "<!doctype html><meta charset=utf-8><title>MachNotes</title>" +
-        "<style>body{font:16px system-ui;max-width:40em;margin:4em auto;padding:0 1em}li{margin:.3em 0}form{margin:1em 0}input[type=text]{padding:.5em;width:70%}button{padding:.5em 1em}</style>" +
-        "<h1>MachNotes</h1><p>Signed in as <b>" + html_escape(email) + "</b> · <a href=\"/logout\">log out</a></p>" +
-        "<form method=post action=\"/notes\"><input type=text name=body placeholder=\"a new note…\" autofocus> <button>Add</button></form>" +
-        "<ul>" + items + "</ul>"
+func dash_styles() (s) {
+    s = "<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;" +
+        "font:15px/1.5 system-ui,sans-serif;color:#e6e6f0;background:radial-gradient(120% 120% at 50% 0%,#0e1626 0%,#08080f 60%)}" +
+        ".card{width:min(540px,94vw);padding:24px 28px 28px;border-radius:16px;background:#0f1422;border:1px solid #20304f;box-shadow:0 20px 60px -20px #000}" +
+        "h1{margin:0 0 4px;font-size:18px;color:#6fa8ff}.who{margin:0 0 16px;font-size:13px;color:#8d86b8}.who a{color:#6fa8ff}" +
+        ".add{display:flex;gap:8px;margin-bottom:14px}.add input{flex:1;min-width:0;padding:9px 11px;border-radius:8px;border:1px solid #2c3a63;background:#0b101d;color:#e6e6f0}" +
+        ".add button{padding:9px 14px;font-weight:700;cursor:pointer;border-radius:8px;border:1px solid #3a63c8;background:#2546a0;color:#fff}" +
+        "#notes{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}#notes li{list-style:none;display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:9px;background:#151d33;border:1px solid #243156}" +
+        ".bd{flex:1}.del{cursor:pointer;border:none;background:none;color:#6b76a0;font-size:18px;line-height:1}.del:hover{color:#ff7a90}" +
+        ".foot{margin-top:16px;font-size:13px;color:#8d86b8;text-align:center}.foot b{color:#cfe0ff}</style>"
+}
+
+// The dashboard is now a reactive WebAssembly SPA: the server renders only the shell
+// (the signed-in chrome + an empty #app + the host script); the wasm client fetches
+// /api/notes and renders the list, and adds/deletes go through the API and reload.
+func dashboard_page(email) (h) {
+    h = "<!doctype html><html lang=en><head><meta charset=utf-8>" +
+        "<meta name=viewport content=\"width=device-width,initial-scale=1\"><title>MachNotes</title>" + dash_styles() + "</head><body>" +
+        "<main class=card>" +
+        "<h1>MachNotes</h1><p class=who>Signed in as <b>" + html_escape(email) + "</b> · <a href=\"/logout\">log out</a></p>" +
+        "<div id=app>loading…</div></main>" +
+        "<script type=module>" + host_js() + "</script></body></html>"
 }
 
 // ---- the app server ----
@@ -156,27 +181,30 @@ func app_handler(req) (res) {
         return
     }
 
+    if req.path == "/app.wasm" {
+        res = ok_wasm(read_file_bytes("app.wasm"))   // the reactive client bundle
+        return
+    }
+
     email, authed := current_user(req)
     if req.path == "/" {
         if authed == 0 { res = ok_html(landing_page())  return }
-        res = ok_html(dashboard_page(email, user_notes(email)))
-        return
-    }
-    if req.path == "/notes" {
-        if authed == 0 { res = redirect("/login")  return }
-        if req.method == "POST" {
-            body := form_field(req.body, "body")
-            if body != "" { add_note(email, body) }
-        }
-        res = redirect("/")
+        res = ok_html(dashboard_page(email))          // the SPA shell; the wasm fills #app
         return
     }
     if req.path == "/api/notes" {
         if authed == 0 { res = bad_request("not authenticated")  return }
-        c := pg_acquire()
-        rows := pgx(c, "SELECT id, body FROM notes WHERE email = $1 ORDER BY id DESC", []string{email})
-        pg_release(c)
-        res = ok_json(rows)
+        if req.method == "POST" {                     // add a note (form body), then return the list
+            body := form_field(req.body, "body")
+            if body != "" { add_note(email, body) }
+        }
+        res = ok_json(notes_json(email))
+        return
+    }
+    if has_prefix(req.path, "/api/notes/del") {       // POST /api/notes/del?id=N
+        if authed == 0 { res = bad_request("not authenticated")  return }
+        del_note(email, query(req, "id"))
+        res = ok_json(notes_json(email))
         return
     }
     res = not_found()
@@ -211,6 +239,11 @@ func main() {
     s := env("SESSION_SECRET")
     if s != "" { g_secret = s }
 
+    ap := env("PORT")
+    if ap != "" { g_app_port = parse_int(ap) }
+    ip := env("IDP_PORT")
+    if ip != "" { g_idp_port = parse_int(ip) }
+
     ph := env("PGHOST")
     if ph == "" { ph = "127.0.0.1" }
     pg_pool_init(8, ph, 5432, "postgres", "machindb", "machin")   // a pool, not one connection
@@ -220,6 +253,7 @@ func main() {
     if rh == "" { rh = "127.0.0.1" }
     redis_pool_init(8, rh, 6379)
 
-    go serve(48191, func(req) { return idp_handler(req) })   // mock IdP
-    serve(48190, func(req) { return app_handler(req) })       // the app
+    println("MachNotes on http://localhost:" + str(g_app_port) + " (mock IdP on :" + str(g_idp_port) + ")")
+    go serve(g_idp_port, func(req) { return idp_handler(req) })   // mock IdP
+    serve(g_app_port, func(req) { return app_handler(req) })       // the app
 }
