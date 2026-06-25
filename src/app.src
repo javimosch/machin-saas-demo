@@ -56,13 +56,19 @@ func json_unq2(s) (r) {
 
 // ---- sessions (signed cookie -> Redis -> email) ----
 
+// Each handler runs in its own goroutine (machweb spawns one per connection), so the
+// datastore connections come from a POOL — acquire per operation, release after. A
+// shared single connection would interleave concurrent requests.
+
 // current_user returns (email, ok) for the request's session, or ("", 0).
 func current_user(req) (email, ok) {
     email = ""
     ok = 0
     sid, sok := get_session(req, g_secret, "sid")    // verify the signed cookie
     if sok == 0 { return }
-    e, rok := redis_get("sess:" + sid)               // session store
+    rc := redis_acquire()
+    e, rok := rget(rc, "sess:" + sid)                // session store
+    redis_release(rc)
     if rok == 1 {
         email = e
         ok = 1
@@ -72,23 +78,37 @@ func current_user(req) (email, ok) {
 // start_session creates a Redis session (1h TTL) and returns the signed Set-Cookie response.
 func start_session(res, email) (r) {
     sid := to_hex(rand_bytes(16))
-    redis_setex("sess:" + sid, 3600, email)
+    rc := redis_acquire()
+    rsetex(rc, "sess:" + sid, 3600, email)
+    redis_release(rc)
     r = set_session(res, g_secret, "sid", sid)
+}
+
+func drop_session(sid) {
+    rc := redis_acquire()
+    d := rdel(rc, "sess:" + sid)
+    redis_release(rc)
 }
 
 // ---- data (Postgres) ----
 
 func db_init() {
-    sqlexec := pg_query("CREATE TABLE IF NOT EXISTS notes (id serial primary key, email text, body text)")
+    c := pg_acquire()
+    made := pgq(c, "CREATE TABLE IF NOT EXISTS notes (id serial primary key, email text, body text)")
+    pg_release(c)
 }
 
 func user_notes(email) (notes) {
-    rows := pg_exec("SELECT id, body FROM notes WHERE email = $1 ORDER BY id DESC", []string{email})
+    c := pg_acquire()
+    rows := pgx(c, "SELECT id, body FROM notes WHERE email = $1 ORDER BY id DESC", []string{email})
+    pg_release(c)
     notes = parse(rows, []Note{})
 }
 
 func add_note(email, body) {
-    ins := pg_exec("INSERT INTO notes (email, body) VALUES ($1, $2)", []string{email, body})
+    c := pg_acquire()
+    ins := pgx(c, "INSERT INTO notes (email, body) VALUES ($1, $2)", []string{email, body})
+    pg_release(c)
 }
 
 // ---- pages ----
@@ -131,7 +151,7 @@ func app_handler(req) (res) {
     }
     if req.path == "/logout" {
         sid, sok := get_session(req, g_secret, "sid")
-        if sok == 1 { d := redis_del("sess:" + sid) }
+        if sok == 1 { drop_session(sid) }
         res = clear_cookie(redirect("/"), "sid")
         return
     }
@@ -153,7 +173,10 @@ func app_handler(req) (res) {
     }
     if req.path == "/api/notes" {
         if authed == 0 { res = bad_request("not authenticated")  return }
-        res = ok_json(pg_exec("SELECT id, body FROM notes WHERE email = $1 ORDER BY id DESC", []string{email}))
+        c := pg_acquire()
+        rows := pgx(c, "SELECT id, body FROM notes WHERE email = $1 ORDER BY id DESC", []string{email})
+        pg_release(c)
+        res = ok_json(rows)
         return
     }
     res = not_found()
@@ -190,12 +213,12 @@ func main() {
 
     ph := env("PGHOST")
     if ph == "" { ph = "127.0.0.1" }
-    pg_connect(ph, 5432, "postgres", "machindb", "machin")
+    pg_pool_init(8, ph, 5432, "postgres", "machindb", "machin")   // a pool, not one connection
     db_init()
 
     rh := env("REDISHOST")
     if rh == "" { rh = "127.0.0.1" }
-    redis_connect(rh, 6379)
+    redis_pool_init(8, rh, 6379)
 
     go serve(48191, func(req) { return idp_handler(req) })   // mock IdP
     serve(48190, func(req) { return app_handler(req) })       // the app

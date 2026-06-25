@@ -55,18 +55,19 @@ curl -c jar -b jar --data-urlencode "body=hello" -L http://localhost:48190/notes
 curl -c jar -b jar http://localhost:48190/api/notes           # -> JSON from Postgres
 ```
 
-## What this demonstrates (and one honest limitation)
+## What this demonstrates
 
 One machin binary is a credible SME backend: an HTTP server, server-rendered UI,
 **OAuth2/OIDC SSO**, **signed sessions in Redis**, and **parameterized Postgres** — all
 in one language, one static binary, no runtime.
 
-**Limitation — connection pooling.** The Postgres and Redis clients hold a *single*
-connection in package globals, but machweb handles each request in its own goroutine.
-This demo is correct for sequential use; under concurrent load the shared connection
-would interleave. A per-request connection pool is the next item on the machin backend
-[north star](https://github.com/javimosch/machin/blob/main/docs/NORTH-STAR-BACKEND.md) —
-this demo is exactly what surfaces that need.
+It is also **concurrency-safe**: machweb handles each request in its own goroutine, so
+the Postgres and Redis connections come from a **pool** (`pg_pool_init` / `pg_acquire` /
+`pg_release`, and the Redis equivalents). Each request acquires its own connection and
+releases it, so parallel requests never interleave — verified at 40 concurrent requests.
+(This demo is what surfaced connection pooling on the backend
+[north star](https://github.com/javimosch/machin/blob/main/docs/NORTH-STAR-BACKEND.md);
+it was added in machin v0.65.0 and this app now uses it.)
 
 Built with [machin](https://github.com/javimosch/machin) · part of
 [awesome-machin](https://github.com/javimosch/awesome-machin).
