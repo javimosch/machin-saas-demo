@@ -1,0 +1,267 @@
+// machweb — a tiny web framework for MFL.
+//
+// Compose it ahead of your app and compile:
+//   machin encode framework/machweb.src yourapp.src > app.mfl
+//   machin run app.mfl
+//
+// Your app provides a `main` that calls serve(port, handler), where handler is
+// a closure  func(Request) Response.  Every request is dispatched to it in its
+// own goroutine; the goroutine's memory is reclaimed when the response is sent.
+
+type Request struct {
+    method  string
+    path    string
+    body    string
+    headers map[string]string   // lowercased header name -> value; read via header(req, name)
+}
+
+type Response struct {
+    status  string
+    ctype   string
+    body    string
+    bin     bytes      // binary body, used when is_bin == 1 (NUL-safe; body is ignored)
+    is_bin  int        // 1 = serve bin (raw bytes), 0 = serve body (text)
+    cookies []string   // Set-Cookie values (added via set_cookie); empty for most responses
+    location string    // Location header (set by redirect); empty for most responses
+}
+
+// redirect returns a 302 to url (a Location header). Compose with set_cookie /
+// set_session to redirect AND set state, e.g. after an OAuth login.
+func redirect(url) (r) {
+    r = Response{status: "302 Found", ctype: "text/html; charset=utf-8", body: "", is_bin: 0, location: url}
+}
+
+// ---- response builders ----
+
+func response(status, ctype, body) (r) {
+    r = Response{status: status, ctype: ctype, body: body, is_bin: 0}
+}
+
+func ok_text(body) (r) { r = response("200 OK", "text/plain; charset=utf-8", body) }
+func ok_html(body) (r) { r = response("200 OK", "text/html; charset=utf-8", body) }
+func ok_json(body) (r) { r = response("200 OK", "application/json", body) }
+func created(body) (r) { r = response("201 Created", "application/json", body) }
+func bad_request(msg) (r) { r = response("400 Bad Request", "text/plain", msg) }
+func not_found() (r) { r = response("404 Not Found", "text/plain", "not found") }
+
+// ok_bytes serves a raw binary body (NUL-safe) with an explicit content type —
+// for assets like wasm/images/fonts a text body would truncate at a NUL byte.
+func ok_bytes(ctype, b) (r) {
+    r = Response{status: "200 OK", ctype: ctype, body: "", bin: b, is_bin: 1}
+}
+// ok_wasm serves a WebAssembly module with the correct content type, so a single
+// machin binary can ship both its SSR HTML and its own .wasm SPA bundle.
+func ok_wasm(b) (r) { r = ok_bytes("application/wasm", b) }
+
+// ---- request helpers ----
+
+// parse_headers builds a map of the request headers (names lowercased), reading
+// the lines between the request line and the blank line before the body.
+func parse_headers(raw) (h) {
+    h = make(map[string]string)
+    start := index(raw, "\r\n")
+    if start < 0 { return }
+    sep := index(raw, "\r\n\r\n")
+    if sep < 0 { sep = len(raw) }
+    block := substr(raw, start + 2, sep)
+    for _, line := range split(block, "\r\n") {
+        ci := index(line, ":")
+        if ci > 0 {
+            h[to_lower(trim(substr(line, 0, ci)))] = trim(substr(line, ci + 1, len(line)))
+        }
+    }
+}
+
+// parse_request extracts the method, path, headers, and body from a raw request.
+func parse_request(raw) (req) {
+    nl := index(raw, "\r\n")
+    line := substr(raw, 0, nl)
+    parts := split(line, " ")
+    m := ""
+    p := "/"
+    if len(parts) >= 2 {
+        m = parts[0]
+        p = parts[1]
+    }
+    req = Request{method: m, path: p, body: http_body(raw), headers: parse_headers(raw)}
+}
+
+// header returns a request header value (case-insensitive), or "" if absent.
+func header(req, name) (v) {
+    v = ""
+    k := to_lower(name)
+    if has(req.headers, k) { v = req.headers[k] }
+}
+
+// param returns the path segment after a prefix:
+//   param("/users/42", "/users/") == "42"
+func param(path, prefix) (v) {
+    if has_prefix(path, prefix) {
+        v = substr(path, len(prefix), len(path))
+    }
+}
+
+// query returns a query-string parameter from the request path (url-decoded), or "":
+//   query(req, "state") for "/callback?code=abc&state=xyz" == "xyz"
+func query(req, name) (v) {
+    v = ""
+    qi := index(req.path, "?")
+    if qi < 0 { return }
+    for _, part := range split(substr(req.path, qi + 1, len(req.path)), "&") {
+        eq := index(part, "=")
+        if eq > 0 {
+            if substr(part, 0, eq) == name { v = url_decode(substr(part, eq + 1, len(part))) }
+        }
+    }
+}
+
+// ---- cookies ----
+
+// cookie returns a request cookie value by name (from the Cookie header), or "".
+func cookie(req, name) (v) {
+    v = ""
+    for _, part := range split(header(req, "cookie"), ";") {
+        kv := trim(part)
+        eq := index(kv, "=")
+        if eq > 0 {
+            if substr(kv, 0, eq) == name { v = substr(kv, eq + 1, len(kv)) }
+        }
+    }
+}
+
+// set_cookie returns res with a Set-Cookie added (Path=/, HttpOnly, SameSite=Lax —
+// safe defaults for a session). Structs are values, so use the returned copy:
+//   return set_cookie(ok_html(page()), "sid", token)
+func set_cookie(res, name, value) (r) {
+    r = res
+    r.cookies = append(r.cookies, name + "=" + value + "; Path=/; HttpOnly; SameSite=Lax")
+}
+
+// clear_cookie returns res with a cookie expired (for logout).
+func clear_cookie(res, name) (r) {
+    r = res
+    r.cookies = append(r.cookies, name + "=; Path=/; Max-Age=0")
+}
+
+// cookie_lines renders the Set-Cookie (and Location) header block for a response.
+func cookie_lines(res) (h) {
+    h = ""
+    for _, c := range res.cookies { h = h + "Set-Cookie: " + c + "\r\n" }
+    if res.location != "" { h = h + "Location: " + res.location + "\r\n" }
+}
+
+// ---- signed sessions ----
+//
+// A session cookie the client cannot forge: value + "." + HMAC-SHA256(secret, value)
+// (a 64-char hex tag). set_session stores it; get_session returns (value, ok=1) only
+// if the tag verifies. Keep `secret` server-side (e.g. from env). The value is
+// readable by the client (signed, not encrypted) — store an id/handle, not secrets.
+
+func session_sign(secret, value) (s) { s = value + "." + hmac_sha256(secret, value) }
+
+func session_verify(secret, signed) (value, ok) {
+    value = ""
+    ok = 0
+    n := len(signed)
+    if n < 65 { return }                          // "." + 64-hex tag minimum
+    if charat(signed, n - 65) != "." { return }
+    v := substr(signed, 0, n - 65)
+    if hmac_sha256(secret, v) == substr(signed, n - 64, n) {
+        value = v
+        ok = 1
+    }
+}
+
+// set_session returns res with a signed session cookie set.
+func set_session(res, secret, name, value) (r) { r = set_cookie(res, name, session_sign(secret, value)) }
+
+// get_session reads + verifies a signed session cookie: (value, ok).
+func get_session(req, secret, name) (value, ok) { value, ok = session_verify(secret, cookie(req, name)) }
+
+// ---- server ----
+
+// content_length parses the Content-Length header value from a request's headers.
+func content_length(head) (n) {
+    n = 0
+    i := index(to_lower(head), "content-length:")
+    if i >= 0 {
+        rest := substr(head, i + 15, len(head))   // text after "content-length:"
+        nl := index(rest, "\r\n")
+        if nl >= 0 { rest = substr(rest, 0, nl) }
+        n = parse_int(trim(rest))
+    }
+}
+
+// read_request reads a whole HTTP request, not just the first packet: a browser
+// often sends the POST body in a separate TCP segment from the headers, so we
+// keep reading until Content-Length bytes of body have arrived.
+func read_request(conn) (raw) {
+    raw = read(conn)
+    sep := index(raw, "\r\n\r\n")
+    if sep >= 0 {
+        clen := content_length(substr(raw, 0, sep))
+        body_start := sep + 4
+        for len(raw) - body_start < clen {
+            chunk := read(conn)
+            if chunk == "" { break }            // connection closed early
+            raw = raw + chunk
+        }
+    }
+}
+
+func machweb_handle(conn, handler) {
+    raw := read_request(conn)
+    req := parse_request(raw)
+    res := handler(req)
+    if res.is_bin == 1 {
+        // binary body: write the headers, then the raw bytes (NUL-safe).
+        head := "HTTP/1.1 " + res.status + "\r\nContent-Type: " + res.ctype + "\r\nContent-Length: " + str(len(res.bin)) + "\r\n" + cookie_lines(res) + "Connection: close\r\n\r\n"
+        write(conn, head)
+        write_bytes(conn, res.bin)
+    } else {
+        out := "HTTP/1.1 " + res.status + "\r\nContent-Type: " + res.ctype + "\r\nContent-Length: " + str(len(res.body)) + "\r\n" + cookie_lines(res) + "Connection: close\r\n\r\n" + res.body
+        write(conn, out)
+    }
+    close(conn)
+}
+
+// serve runs the HTTP server. Each connection is handled in its own goroutine.
+func serve(port, handler) {
+    server := listen(port)
+    println("machweb on http://localhost:" + str(port))
+    for {
+        conn := accept(server)
+        go machweb_handle(conn, handler)
+    }
+}
+
+// ---- map-based router ----
+//
+// A router maps "METHOD PATH" to a handler closure func(Request) Response.
+//
+//   r := new_router()
+//   route(r, "GET", "/", func(req) { return ok_text("home") })
+//   serve_router(48080, r)
+
+func new_router() (r) {
+    r = make(map[string]func)
+}
+
+func route(router, method, path, handler) {
+    router[method + " " + path] = handler
+}
+
+func dispatch(router, req) (res) {
+    key := req.method + " " + req.path
+    if has(router, key) {
+        h := router[key]
+        res = h(req)
+    } else {
+        res = not_found()
+    }
+}
+
+// serve_router runs a router-backed server.
+func serve_router(port, router) {
+    serve(port, func(req) { return dispatch(router, req) })
+}
